@@ -1,0 +1,11 @@
+certifi==2025.1.1
+charset-normalizer==3.3.2
+idna==3.7
+imbalanced-learn==0.12.2
+joblib==1.4.2
+matplotlib==3.8.4
+numpy==1.26.4
+pandas==2.2.2
+scikit-learn==1.4.2
+seaborn==0.13.2
+yagmail==0.15.293
