@@ -190,9 +190,9 @@ print("MinMaxScaler sauvegardé sous 'ids_minmax_scaler.pkl'")
 # --- Partie Système d'Alerte par E-mail et Simulation ---
 
 # Configuration E-mail pour les alertes (Utilisez VOTRE mot de passe d'application ici)
-SENDER_EMAIL = "duvalkouatchou@gmail.com"  # VOTRE adresse Gmail
-SENDER_PASSWORD = "bjob gmrs hnhp sbkk"  # VOTRE mot de passe d'application Google (16 caractères)
-RECEIVER_EMAIL = "rubendeffo@gmail.com"  # L'adresse où envoyer les alertes
+SENDER_EMAIL = "SENDER_MAIL@gmail.com"  # VOTRE adresse Gmail
+SENDER_PASSWORD = "PASSWORD"  # VOTRE mot de passe d'application Google (16 caractères)
+RECEIVER_EMAIL = "RECEVER_MAIL@gmail.com"  # L'adresse où envoyer les alertes
 
 def send_alert_email(attack_details, current_accuracy, current_roc_auc, current_classification_rep, current_confusion_mat):
     """
