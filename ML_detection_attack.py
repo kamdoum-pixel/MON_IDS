@@ -122,7 +122,7 @@ print(f"Forme des données après pré-traitement (test): {X_test_processed.shap
 
 # --- Entraînement du Modèle ---
 print("\nEntraînement du modèle Random Forest...")
-model = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+model = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1, class_weight='balanced')
 model.fit(X_train_processed, y_train)
 print("Entraînement terminé.")
 
