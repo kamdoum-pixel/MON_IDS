@@ -167,7 +167,6 @@ Cordialement,
 
 ERATOS.
 
-
 """
         if current_accuracy is not None and current_roc_auc is not None and current_classification_rep is not None and current_confusion_mat is not None:
             body += f"\n\n--- Rapport de Performance du Modèle (Global) ---\n"
