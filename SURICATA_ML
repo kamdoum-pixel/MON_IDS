@@ -1,0 +1,303 @@
+import pandas as pd
+import numpy as np
+import json # Nouveau: pour parser les logs JSON de Suricata
+import datetime
+import os
+import time # Nouveau: pour les délais d'attente lors de la lecture des logs
+import joblib
+import yagmail
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, MinMaxScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, roc_curve, auc
+import matplotlib.pyplot as plt
+
+
+# Définir les noms de colonnes pour le dataset NSL-KDD (reste inchangé)
+feature_names = [
+    'duration', 'protocol_type', 'service', 'flag', 'src_bytes', 'dst_bytes',
+    'land', 'wrong_fragment', 'urgent', 'hot', 'num_failed_logins',
+    'logged_in', 'num_compromised', 'root_shell', 'su_attempted', 'num_root',
+    'num_file_creations', 'num_shells', 'num_access_files', 'num_outbound_cmds',
+    'is_host_login', 'is_guest_login', 'count', 'srv_count', 'serror_rate',
+    'srv_serror_rate', 'rerror_rate', 'srv_rerror_rate', 'same_srv_rate',
+    'diff_srv_rate', 'srv_diff_host_rate', 'dst_host_count', 'dst_host_srv_count',
+    'dst_host_same_srv_rate', 'dst_host_diff_srv_rate', 'dst_host_same_src_port_rate',
+    'dst_host_srv_diff_host_rate', 'dst_host_serror_rate', 'dst_host_srv_serror_rate',
+    'dst_host_rerror_rate', 'dst_host_srv_rerror_rate', 'attack_type'
+]
+
+# --- VOS FONCTIONS DE CHARGEMENT ET D'ENTRAINEMENT DU MODÈLE RESTENT ICI ---
+# Elles doivent charger vos données NSL-KDD, entraîner le modèle,
+# et sauvegarder `model`, `preprocessor`, `scaler_X`.
+
+# --- Fonction d'Extraction de Caractéristiques à partir de Eve JSON (voir ci-dessus) ---
+# Copiez la fonction `extract_features_from_eve_json` ici.
+def extract_features_from_eve_json(eve_event, feature_names):
+    """
+    Extrait les caractéristiques de type NSL-KDD d'un événement Eve JSON de Suricata.
+    Ceci est une MAPPING SIMPLIFIÉE et doit être adaptée/améliorée !
+    Les caractéristiques basées sur des agrégations (count, rate sur hôtes/services)
+    ne peuvent pas être dérivées d'un simple événement et sont initialisées à des valeurs par défaut.
+
+    :param eve_event: Un dictionnaire représentant un événement Eve JSON.
+    :param feature_names: La liste des noms de caractéristiques NSL-KDD attendues par le modèle.
+    :return: Un DataFrame Pandas avec une seule ligne, contenant les caractéristiques extraites.
+    """
+    features = {name: 0 for name in feature_names if name != 'attack_type'} # Initialise toutes les features à 0
+
+    if eve_event.get("event_type") == "flow":
+        flow_data = eve_event
+
+        # duration (calculé à partir de start et end)
+        try:
+            start_time = datetime.datetime.fromisoformat(flow_data.get("start", "1970-01-01T00:00:00+0000").replace('Z', '+00:00'))
+            end_time = datetime.datetime.fromisoformat(flow_data.get("end", "1970-01-01T00:00:00+0000").replace('Z', '+00:00'))
+            features['duration'] = (end_time - start_time).total_seconds()
+            if features['duration'] < 0: features['duration'] = 0
+        except ValueError:
+            features['duration'] = 0
+
+        # protocol_type
+        features['protocol_type'] = flow_data.get("proto", "unknown").lower()
+
+        # service (souvent lié au port ou à l'app_proto)
+        app_proto = flow_data.get("app_proto")
+        dest_port = flow_data.get("dest_port")
+        if app_proto:
+            features['service'] = app_proto
+        elif dest_port == 80:
+            features['service'] = "http"
+        elif dest_port == 443:
+            features['service'] = "https"
+        elif dest_port == 21:
+            features['service'] = "ftp"
+        elif dest_port == 22:
+            features['service'] = "ssh"
+        else:
+            features['service'] = "other"
+
+        # src_bytes, dst_bytes
+        features['src_bytes'] = flow_data.get("bytes_toserver", 0)
+        features['dst_bytes'] = flow_data.get("bytes_toclient", 0)
+
+        features['logged_in'] = 0 # Default (needs external context)
+        features['flag'] = "SF" # Default, often requires TCP flag analysis
+
+        # Remaining features, mostly aggregations, set to defaults
+        features['land'] = 0
+        features['wrong_fragment'] = 0
+        features['urgent'] = 0
+        features['hot'] = 0
+        features['num_failed_logins'] = 0
+        features['num_compromised'] = 0
+        features['root_shell'] = 0
+        features['su_attempted'] = 0
+        features['num_root'] = 0
+        features['num_file_creations'] = 0
+        features['num_shells'] = 0
+        features['num_access_files'] = 0
+        features['num_outbound_cmds'] = 0
+        features['is_host_login'] = 0
+        features['is_guest_login'] = 0
+        
+        features['count'] = flow_data.get("pkts_toserver", 0) + flow_data.get("pkts_toclient", 0)
+        features['srv_count'] = features['count']
+        features['serror_rate'] = 0.0
+        features['srv_serror_rate'] = 0.0
+        features['rerror_rate'] = 0.0
+        features['srv_rerror_rate'] = 0.0
+
+        features['same_srv_rate'] = 1.0
+        features['diff_srv_rate'] = 0.0
+        features['srv_diff_host_rate'] = 0.0
+
+        features['dst_host_count'] = 1
+        features['dst_host_srv_count'] = 1
+        features['dst_host_same_srv_rate'] = 1.0
+        features['dst_host_diff_srv_rate'] = 0.0
+        features['dst_host_same_src_port_rate'] = 0.0
+        features['dst_host_srv_diff_host_rate'] = 0.0
+        features['dst_host_serror_rate'] = 0.0
+        features['dst_host_srv_serror_rate'] = 0.0
+        features['dst_host_rerror_rate'] = 0.0
+        features['dst_host_srv_rerror_rate'] = 0.0
+
+    elif eve_event.get("event_type") == "alert":
+        # Pour les alertes générées par les règles Suricata, nous pouvons aussi les considérer.
+        # Vous pouvez décider de faire passer ces alertes par le ML ou non.
+        # Souvent, si Suricata a déjà alerté, c'est déjà une menace connue.
+        # Mais le ML peut apporter un contexte additionnel.
+        pass # Pas de features NSL-KDD directes pour les alertes.
+        # Vous pouvez enrichir 'attack_details' pour l'email ici si c'est une alerte Suricata directe.
+
+    feature_row = pd.DataFrame([features])[feature_names[:-1]]
+    return feature_row
+
+# --- Fonction d'Envoi d'Alerte par E-mail (reste la même) ---
+# Assurez-vous que les variables SENDER_EMAIL, SENDER_PASSWORD, RECEIVER_EMAIL sont configurées.
+# (Copiez votre fonction send_alert_email ici)
+SENDER_EMAIL = "duvalkouatchou@gmail.com"
+SENDER_PASSWORD = "bjob gmrs hnhp sbkk"
+RECEIVER_EMAIL = ["docteurkamdoum@gmail.com", "autre_destinataire@example.com"]
+
+def send_alert_email(attack_details, current_accuracy=None, current_roc_auc=None, current_classification_rep=None, current_confusion_mat=None):
+    # ... votre code de la fonction send_alert_email ...
+    try:
+        yag = yagmail.SMTP(SENDER_EMAIL, SENDER_PASSWORD)
+        current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        subject = f"🔔 ALERTE IDS : Intrusion Détectée à {current_time}!"
+        
+        body = f"""
+Cher Administrateur,
+
+Je suis ERATOS votre IDS.
+
+Je viens de détecter une activité suspecte sur le réseau.
+
+Détails de l'incident :
+- **Type d'incident :** INTRUSION NON AUTORISE 
+- **Heure de l'attaque :** {current_time}
+- **Détails additionnels :** {attack_details}
+
+Veuillez examiner cette alerte et prendre les mesures nécessaires au plus vite, car comme le dit PARKINSON "plus on a de temps pour réaliser une tâche, plus cette tâche prend du temps."
+
+Cordialement,
+
+ERATOS.
+
+
+"""
+        if current_accuracy is not None and current_roc_auc is not None and current_classification_rep is not None and current_confusion_mat is not None:
+            body += f"\n\n--- Rapport de Performance du Modèle (Global) ---\n"
+            body += f"Précision (Accuracy): {current_accuracy:.4f}\n"
+            body += f"Score AUC: {current_roc_auc:.4f}\n"
+            body += f"\nRapport de Classification:\n{current_classification_rep}\n"
+            body += f"Matrice de Confusion:\n{current_confusion_mat}\n"
+
+        yag.send(to=RECEIVER_EMAIL, subject=subject, contents=body)
+        print(f"🚨 Alerte par e-mail envoyée avec succès à {RECEIVER_EMAIL}.")
+    except Exception as e:
+        print(f"❌ Erreur lors de l'envoi de l'e-mail d'alerte (Yagmail) : {e}")
+        print("Vérifiez vos identifiants Yagmail (SENDER_EMAIL, SENDER_PASSWORD), l'adresse RECEIVER_EMAIL et votre connexion internet.")
+
+
+# --- VOS ÉTAPES D'ENTRAÎNEMENT ET DE SAUVEGARDE DU MODÈLE ---
+# Cette partie doit s'exécuter une seule fois pour entraîner et sauvegarder le modèle.
+# Assurez-vous que vos fichiers 'ids_random_forest_model.pkl', 'ids_preprocessor.pkl', 'ids_minmax_scaler.pkl'
+# existent et sont à jour.
+
+# --- Chargement des objets nécessaires pour la détection en temps réel ---
+try:
+    loaded_model = joblib.load('ids_random_forest_model.pkl')
+    loaded_preprocessor = joblib.load('ids_preprocessor.pkl')
+    loaded_minmax_scaler = joblib.load('ids_minmax_scaler.pkl')
+    print("Modèle et préprocesseurs chargés avec succès.")
+except FileNotFoundError:
+    print("Erreur: Assurez-vous que 'ids_random_forest_model.pkl', 'ids_preprocessor.pkl' et 'ids_minmax_scaler.pkl' existent.")
+    print("Exécutez la partie d'entraînement et de sauvegarde du script en premier.")
+    exit()
+
+# --- NOUVEAU : Surveillance des Logs Suricata en Temps Réel ---
+SURICATA_EVE_LOG_PATH = "/var/log/suricata/eve.json" # Assurez-vous que ce chemin est correct
+
+print(f"\n--- Démarrage de la surveillance du fichier de log Suricata : {SURICATA_EVE_LOG_PATH} ---")
+
+# Vérifier si le fichier de log existe, sinon attendre sa création
+if not os.path.exists(SURICATA_EVE_LOG_PATH):
+    print(f"Le fichier de log {SURICATA_EVE_LOG_PATH} n'existe pas encore. En attente...")
+    while not os.path.exists(SURICATA_EVE_LOG_PATH):
+        time.sleep(5) # Attendre 5 secondes avant de vérifier à nouveau
+    print(f"Fichier de log {SURICATA_EVE_LOG_PATH} détecté.")
+
+# Boucle principale pour lire le fichier de log en continu
+# Utilisation de 'with open' pour une meilleure gestion des ressources
+# et 'seek(0, 2)' pour se positionner à la fin du fichier au démarrage.
+try:
+    with open(SURICATA_EVE_LOG_PATH, 'r') as f:
+        # Aller à la fin du fichier pour ne lire que les nouvelles lignes
+        f.seek(0, os.SEEK_END)
+        print("Prêt à lire de nouvelles entrées de log. CTRL+C pour arrêter.")
+        
+        while True:
+            # Lire les nouvelles lignes
+            new_line = f.readline()
+            if new_line:
+                try:
+                    eve_event = json.loads(new_line.strip())
+                    
+                    # Traiter uniquement les événements de type 'flow' ou 'alert' pour le ML
+                    if eve_event.get("event_type") in ["flow", "alert"]:
+                        print(f"\nNouvel événement Suricata détecté ({eve_event.get('event_type')}):")
+                        # print(json.dumps(eve_event, indent=2)) # Décommenter pour voir le JSON brut
+
+                        # Extraire les caractéristiques
+                        input_df = extract_features_from_eve_json(eve_event, feature_names)
+
+                        # Appliquer le pré-traitement
+                        # Vérifier si toutes les colonnes numériques/catégorielles du preprocessor sont dans input_df
+                        # Si non, cela indique un problème de mapping ou des données Eve JSON manquantes
+                        # Ce cas devrait être géré plus robustement si extract_features_from_eve_json est simplifié.
+                        
+                        # --- Vérification des colonnes avant transformation ---
+                        # Ceci est important car le preprocessor s'attend à un certain set de colonnes.
+                        missing_cols_num = set(loaded_preprocessor.named_transformers_['num'].feature_names_in_) - set(input_df.columns)
+                        missing_cols_cat = set(loaded_preprocessor.named_transformers_['cat'].feature_names_in_) - set(input_df.columns)
+                        
+                        if missing_cols_num or missing_cols_cat:
+                            print(f"AVERTISSEMENT: Caractéristiques manquantes dans l'input pour le préprocesseur:")
+                            if missing_cols_num: print(f"Numériques: {missing_cols_num}")
+                            if missing_cols_cat: print(f"Catégorielles: {missing_cols_cat}")
+                            print("Cela peut indiquer un problème avec extract_features_from_eve_json ou le dataset Suricata.")
+                            # Vous pouvez choisir de sauter cet événement ou de le traiter avec des valeurs par défaut.
+                            # Pour l'instant, nous continuons, en espérant que le mapping par défaut est suffisant.
+
+                        processed_features = loaded_preprocessor.transform(input_df)
+                        scaled_features = loaded_minmax_scaler.transform(processed_features)
+
+                        # Faire la prédiction
+                        prediction = loaded_model.predict(scaled_features)[0]
+                        prediction_proba = loaded_model.predict_proba(scaled_features)[0]
+
+                        print(f"Prédiction ML: {'Attaque' if prediction == 1 else 'Normal'}")
+                        if prediction == 1:
+                            # Précision, AUC, etc. du dernier rapport global.
+                            # Pour une alerte en temps réel, on ne les a pas pour chaque prédiction.
+                            # Mais on peut les passer depuis la phase d'entraînement.
+                            # Assurez-vous que `accuracy`, `roc_auc`, `classification_rep`, `confusion_mat`
+                            # sont des variables globales ou passées d'une manière ou d'une autre.
+                            # Pour l'exemple, j'assume que vous les avez sauvegardées ou que la fonction
+                            # `send_alert_email` peut les gérer comme étant optionnelles.
+                            
+                            # Utilisez les métriques globales calculées précédemment lors de l'entraînement
+                            # (Ces variables doivent être accessibles ici, par exemple en tant que globales
+                            # ou en passant le résultat de l'entraînement dans une structure).
+                            
+                            # Exemple pour l'e-mail:
+                            details_for_email = f"Source IP: {eve_event.get('src_ip', 'N/A')}, " \
+                                                f"Destination IP: {eve_event.get('dest_ip', 'N/A')}, " \
+                                                f"Protocole: {eve_event.get('proto', 'N/A')}, " \
+                                                f"Service: {eve_event.get('app_proto', eve_event.get('dest_port', 'N/A'))}\n" \
+                                                f"Probabilité d'attaque: {prediction_proba[1]*100:.2f}%"
+
+                            # Il faut s'assurer que accuracy, roc_auc, classification_rep, confusion_mat
+                            # sont définis et accessibles ici. Si vous exécutez le script en une seule fois,
+                            # ces variables de l'évaluation globale le seront.
+                            send_alert_email(details_for_email, accuracy, roc_auc, classification_rep, str(confusion_mat))
+
+                        else:
+                            print(f"Probabilité de normal: {prediction_proba[0]*100:.2f}%")
+
+                except json.JSONDecodeError as e:
+                    print(f"Erreur de parsing JSON: {e} dans la ligne: {new_line.strip()}")
+                except Exception as e:
+                    print(f"Erreur inattendue lors du traitement d'un événement: {e}")
+            else:
+                # Aucune nouvelle ligne, attendre un peu avant de réessayer
+                time.sleep(0.5) # Attendre 500 ms
+
+except KeyboardInterrupt:
+    print("\nArrêt de la surveillance des logs Suricata.")
+except Exception as e:
+    print(f"Une erreur grave est survenue lors de la surveillance: {e}")
